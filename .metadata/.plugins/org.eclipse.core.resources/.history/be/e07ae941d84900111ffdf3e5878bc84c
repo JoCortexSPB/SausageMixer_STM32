@@ -1,0 +1,590 @@
+
+#include "main.h"
+#include "usb_device.h"
+#include <string.h>
+
+#include "ADS1115.h"
+#include "AD5328.h"
+
+I2C_HandleTypeDef hi2c1;
+RTC_HandleTypeDef hrtc;
+SPI_HandleTypeDef hspi1;
+SPI_HandleTypeDef hspi2;
+TIM_HandleTypeDef htim2;
+
+AD5328_HandleTypeDef dac;
+ADS1115_HandleTypeDef adc;
+
+void Motherboard_ProcessCommand(uint8_t cmd);
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_RTC_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_SPI2_Init(void);
+static void MX_TIM2_Init(void);
+void Servo_PulseStart(void);
+void Servo_PulseStop(void);
+void Servo_SetPulseFrequency(uint32_t freq_hz);
+
+typedef enum
+{
+	STATE_IDLE = 0,
+	STATE_RUNNING = 1,
+	STATE_ERROR = 10
+} MachineState_t;
+
+typedef enum
+{
+	STAGE_NOINIT = 0,
+	STAGE_CYCLE = 1,
+	STAGE_REWARD = 2,
+	STAGE_SEEKHOME = 3
+} ProgramStage_t;
+
+float ITV_PRESSURE = 0.0f;
+float REG_ITV = 0.0f;
+float REG_CAROUSEL = 0.0f;
+float REG_CARRIAGE = 0.0f;
+
+uint8_t rx_cmd;
+volatile uint8_t spi_cmd_ready = 0;
+volatile uint8_t spi_last_cmd = 0;
+volatile HAL_StatusTypeDef spi_rx_status;
+volatile uint32_t spi_error_code = 0;
+volatile uint32_t spi_rx_count = 0;
+volatile uint32_t spi_err_count = 0;
+
+volatile uint8_t g_state = STATE_IDLE;
+volatile uint8_t g_stage = STAGE_NOINIT;
+
+uint8_t HOMESENSOR = 0;
+uint8_t CNTSENSOR = 0;
+uint8_t NEARSENSOR = 0;
+uint8_t FARSENSOR = 0;
+
+int main(void)
+{
+
+HAL_Init();
+
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_RTC_Init();
+  MX_SPI1_Init();
+  MX_SPI2_Init();
+  MX_USB_DEVICE_Init();
+  MX_TIM2_Init();
+
+  dac.hspi = &hspi1;
+  dac.sync_port = AD5328_SYNC_GPIO_Port;
+  dac.sync_pin = AD5328_SYNC_Pin;
+  dac.ldac_port = AD5328_LDAC_GPIO_Port;
+  dac.ldac_pin = AD5328_LDAC_Pin;
+
+  dac.vref = 5.0f;
+  dac.gain = 2.0f;
+
+  AD5328_Init(&dac);
+
+  adc.hi2c = &hi2c1;
+  adc.address = ADS1115_DEFAULT_ADDR;
+
+  adc.pga = ADS1115_PGA_6_144V;
+  adc.data_rate = ADS1115_DR_128SPS;
+
+  ADS1115_Init(&adc);
+
+  spi_rx_status = HAL_SPI_Receive_IT(&hspi2, &rx_cmd, 1);
+
+
+  while (1)
+  {
+	  ADS1115_ReadVoltageSingleEnded(&adc, ADS1115_CHANNEL_0, &ITV_PRESSURE);
+	  ADS1115_ReadVoltageSingleEnded(&adc, ADS1115_CHANNEL_1, &REG_CAROUSEL);
+	  ADS1115_ReadVoltageSingleEnded(&adc, ADS1115_CHANNEL_2, &REG_CARRIAGE);
+	  ADS1115_ReadVoltageSingleEnded(&adc, ADS1115_CHANNEL_3, &REG_ITV);
+
+	  AD5328_WriteABCD_Voltage(&dac,
+	  		  REG_ITV * 2, REG_CAROUSEL * 2, 0.8f + REG_CARRIAGE * 2, 0.8f);
+
+	  if(spi_cmd_ready)
+	  {
+		  spi_cmd_ready = 0;
+		  Motherboard_ProcessCommand(spi_last_cmd);
+	  }
+
+	  if(g_state == STATE_IDLE)
+	  {
+		  HOMESENSOR = HAL_GPIO_ReadPin(HMSENSOR_GPIO_Port, HMSENSOR_Pin);
+		  CNTSENSOR = HAL_GPIO_ReadPin(CNTSENSOR_GPIO_Port, CNTSENSOR_Pin);
+		  NEARSENSOR = HAL_GPIO_ReadPin(NEARSENSOR_GPIO_Port, NEARSENSOR_Pin);
+		  FARSENSOR = HAL_GPIO_ReadPin(FARSENSOR_GPIO_Port, FARSENSOR_Pin);
+		  HAL_GPIO_WritePin(SRV_ON_CTRL_GPIO_Port, SRV_ON_CTRL_Pin, GPIO_PIN_RESET);
+		  HAL_GPIO_WritePin(SRV_SIGN_CTRL_GPIO_Port, SRV_SIGN_CTRL_Pin, GPIO_PIN_RESET);
+
+	  } else if(g_state == STATE_RUNNING)
+	  {
+		  HAL_GPIO_WritePin(SRV_ON_CTRL_GPIO_Port, SRV_ON_CTRL_Pin, GPIO_PIN_SET);
+		  if(g_stage == STAGE_NOINIT)
+		  {
+
+		  } else if(g_stage == STAGE_CYCLE)
+		  {
+
+		  } else if(g_stage == STAGE_REWARD)
+		  {
+
+		  } else if(g_stage == STAGE_SEEKHOME)
+		  {
+
+		  }
+	  }
+  }
+}
+
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI2)
+    {
+        spi_rx_count++;
+
+        spi_last_cmd = rx_cmd;
+        spi_cmd_ready = 1;
+
+        spi_rx_status = HAL_SPI_Receive_IT(&hspi2, &rx_cmd, 1);
+    }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI2)
+    {
+        spi_err_count++;
+        spi_error_code = HAL_SPI_GetError(hspi);
+
+        __HAL_SPI_CLEAR_OVRFLAG(hspi);
+
+        HAL_SPI_Abort_IT(hspi);
+
+        spi_rx_status = HAL_SPI_Receive_IT(&hspi2, &rx_cmd, 1);
+    }
+}
+
+void Motherboard_ProcessCommand(uint8_t cmd)
+{
+    switch (cmd)
+    {
+        case CMD_START:
+            g_state = STATE_RUNNING;
+            break;
+
+        case CMD_STOP:
+            g_state = STATE_IDLE;
+            break;
+
+        case CMD_AIR:
+            // управление воздухом
+            break;
+
+        case CMD_RESET:
+            // сброс
+            break;
+
+        case CMD_LEFT:
+            // движение/меню влево
+            break;
+
+        case CMD_RIGHT:
+            // движение/меню вправо
+            break;
+
+        case CMD_UP:
+            HAL_GPIO_WritePin(SRV_SIGN_CTRL_GPIO_Port, SRV_SIGN_CTRL_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(SRV_PULS_CTRL_GPIO_Port, SRV_PULS_CTRL_Pin, GPIO_PIN_RESET);
+            break;
+
+        case CMD_DOWN:
+        	HAL_GPIO_WritePin(SRV_SIGN_CTRL_GPIO_Port, SRV_SIGN_CTRL_Pin, GPIO_PIN_RESET);
+        	HAL_GPIO_WritePin(SRV_PULS_CTRL_GPIO_Port, SRV_PULS_CTRL_Pin, GPIO_PIN_SET);
+            break;
+
+        default:
+            // неизвестная команда
+            break;
+    }
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC|RCC_PERIPHCLK_USB;
+  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
+  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 10000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef DateToUpdate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.AsynchPrediv = RTC_AUTO_1_SECOND;
+  hrtc.Init.OutPut = RTC_OUTPUTSOURCE_ALARM;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
+  DateToUpdate.Month = RTC_MONTH_JANUARY;
+  DateToUpdate.Date = 0x1;
+  DateToUpdate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_1LINE;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_SLAVE;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, AD5328_SYNC_Pin|AD5328_LDAC_Pin|SMALLVALVE_CTRL_Pin|BIGVALVE_CTRL_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, VF_FRW_CTRL_Pin|VF_REV_CTRL_Pin|SRV_ON_CTRL_Pin|SRV_PULS_CTRL_Pin
+                          |SRV_SIGN_CTRL_Pin|CNT_ECHO_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : HMSENSOR_Pin CNTSENSOR_Pin NEARSENSOR_Pin FARSENSOR_Pin
+                           USB_HPD_Pin */
+  GPIO_InitStruct.Pin = HMSENSOR_Pin|CNTSENSOR_Pin|NEARSENSOR_Pin|FARSENSOR_Pin
+                          |USB_HPD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : AD5328_SYNC_Pin AD5328_LDAC_Pin SMALLVALVE_CTRL_Pin BIGVALVE_CTRL_Pin */
+  GPIO_InitStruct.Pin = AD5328_SYNC_Pin|AD5328_LDAC_Pin|SMALLVALVE_CTRL_Pin|BIGVALVE_CTRL_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : VF_FRW_CTRL_Pin VF_REV_CTRL_Pin SRV_ON_CTRL_Pin SRV_PULS_CTRL_Pin
+                           SRV_SIGN_CTRL_Pin CNT_ECHO_Pin */
+  GPIO_InitStruct.Pin = VF_FRW_CTRL_Pin|VF_REV_CTRL_Pin|SRV_ON_CTRL_Pin
+                          |SRV_SIGN_CTRL_Pin|CNT_ECHO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = SRV_PULS_CTRL_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(SRV_PULS_CTRL_GPIO_Port, &GPIO_InitStruct);
+
+  __HAL_RCC_AFIO_CLK_ENABLE();
+  __HAL_AFIO_REMAP_TIM2_PARTIAL_2();
+}
+
+static void MX_TIM2_Init(void)
+{
+	TIM_OC_InitTypeDef sConfigOC = {0};
+
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+
+    // PB10 = TIM2_CH3
+    __HAL_AFIO_REMAP_TIM2_PARTIAL_2();
+
+    htim2.Instance = TIM2;
+    htim2.Init.Prescaler = 48 - 1;          // 48 MHz / 48 = 1 MHz
+    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim2.Init.Period = 1000 - 1;           // 1 kHz
+    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = 500;                  // 50% duty
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+void Servo_PulseStart(void)
+{
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+}
+
+void Servo_PulseStop(void)
+{
+    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3);
+    HAL_GPIO_WritePin(SRV_PULS_CTRL_GPIO_Port, SRV_PULS_CTRL_Pin, GPIO_PIN_RESET);
+}
+
+void Servo_SetPulseFrequency(uint32_t freq_hz)
+{
+    if (freq_hz == 0)
+    {
+        Servo_PulseStop();
+        return;
+    }
+
+    uint32_t timer_clk = 1000000UL;
+
+    uint32_t period = timer_clk / freq_hz;
+
+    if (period < 2)
+    {
+        period = 2;
+    }
+
+    __HAL_TIM_SET_AUTORELOAD(&htim2, period - 1);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, period / 2);
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

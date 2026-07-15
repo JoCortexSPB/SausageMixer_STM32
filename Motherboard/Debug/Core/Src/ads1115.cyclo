@@ -1,0 +1,8 @@
+../Core/Src/ads1115.c:3:26:ADS1115_WriteRegister	1
+../Core/Src/ads1115.c:18:26:ADS1115_ReadRegister	3
+../Core/Src/ads1115.c:44:17:ADS1115_GetMuxBitsSingleEnded	5
+../Core/Src/ads1115.c:64:17:ADS1115_GetConversionDelayMs	9
+../Core/Src/ads1115.c:85:19:ADS1115_Init	4
+../Core/Src/ads1115.c:100:19:ADS1115_ReadRawSingleEnded	5
+../Core/Src/ads1115.c:159:7:ADS1115_RawToVoltage	7
+../Core/Src/ads1115.c:183:19:ADS1115_ReadVoltageSingleEnded	2

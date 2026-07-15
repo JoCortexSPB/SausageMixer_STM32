@@ -1,0 +1,13 @@
+../Core/Src/ad5328.c:5:26:AD5328_SendWord	1
+../Core/Src/ad5328.c:45:19:AD5328_Init	5
+../Core/Src/ad5328.c:70:19:AD5328_WriteRaw	3
+../Core/Src/ad5328.c:99:19:AD5328_WriteVoltage	3
+../Core/Src/ad5328.c:122:6:AD5328_LDAC_Pulse	1
+../Core/Src/ad5328.c:138:19:AD5328_WriteABCD_Raw	5
+../Core/Src/ad5328.c:165:19:AD5328_WriteABCD_Voltage	5
+../Core/Src/ad5328.c:191:19:AD5328_ResetData	1
+../Core/Src/ad5328.c:203:19:AD5328_ResetDataAndControl	1
+../Core/Src/ad5328.c:215:19:AD5328_SetGainABCD_X2	1
+../Core/Src/ad5328.c:233:19:AD5328_SetGainABCD_X1	1
+../Core/Src/ad5328.c:242:19:AD5328_SetGainAll_X2	1
+../Core/Src/ad5328.c:252:19:AD5328_SetGainAll_X1	1

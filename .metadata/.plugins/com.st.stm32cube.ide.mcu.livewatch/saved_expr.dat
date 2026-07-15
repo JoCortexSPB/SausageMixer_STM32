@@ -1,0 +1,17 @@
+REG_ITV
+REG_CAROUSEL
+REG_CARRIAGE
+g_state
+g_stage
+spi_rx_count
+spi_rx_status
+hspi2.State
+hspi2.ErrorCode
+ITV_PRESSURE
+ITV_PRESSURE_STATUS
+HOMESENSOR
+CNTSENSOR
+NEARSENSOR
+FARSENSOR
+meter
+AIROUT
