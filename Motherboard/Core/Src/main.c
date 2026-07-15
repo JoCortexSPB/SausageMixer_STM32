@@ -4,6 +4,7 @@
 
 #include "ADS1115.h"
 #include "AD5328.h"
+#include "mixer_cdc.h"
 
 /* =========================================================
  * ПЕРИФЕРИЯ
@@ -22,6 +23,14 @@ ADS1115_HandleTypeDef adc;
  * ========================================================= */
 
 void Motherboard_ProcessCommand(uint8_t cmd);
+static void Motherboard_ProcessCDCCommands(void);
+static void Motherboard_SetAir(uint8_t enabled);
+static void Motherboard_SafeAirOff(void);
+static void Motherboard_SafeStop(void);
+static void Motherboard_CDCSafetyTick(void);
+static void Motherboard_CDCBurstDetection(void);
+static void Motherboard_SendCDCTelemetry(void);
+static void Motherboard_ResetBurstDetector(void);
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -90,19 +99,26 @@ typedef enum
 /*
  * Защита от явно ошибочного показания ADS1115.
  */
-#define ITV_SENSOR_MIN_VALID         -0.05f
-#define ITV_SENSOR_MAX_VALID          6.00f
+#define ITV_SENSOR_MIN_VALID          0.35f
+#define ITV_SENSOR_MAX_VALID          2.05f
+
+/* 4...20 мА на шунте 100 Ом: 0.40...2.00 В. */
+#define ITV_SENSOR_ZERO_V             0.40f
+
+/* Защитные параметры удалённого испытания оболочки. */
+#define CDC_CONTROL_TIMEOUT_MS        750U
+#define CDC_STREAM_PERIOD_MIN_MS      20U
+#define CDC_STREAM_PERIOD_MAX_MS      1000U
+#define CDC_BURST_HISTORY_SIZE        32U
+#define CDC_BURST_MIN_RISE_V          0.06f
+#define CDC_BURST_CONFIRM_SAMPLES     2U
 
 /* =========================================================
  * АНАЛОГОВЫЕ СИГНАЛЫ
  * ========================================================= */
 
-float ITV_PRESSURE = 0.0f;
+float ITV_PRESSURE = ITV_SENSOR_ZERO_V;
 
-/*
- * Временно не используется.
- * Канал ADS1115_CHANNEL_3 не читается.
- */
 float REG_ITV = 0.0f;
 
 float REG_CAROUSEL = 0.0f;
@@ -163,6 +179,22 @@ volatile uint8_t bigairon = 0;
 static uint32_t itv_control_tick = 0;
 
 /* =========================================================
+ * USB CDC / ИСПЫТАНИЕ ОБОЛОЧКИ
+ * ========================================================= */
+
+static uint8_t cdc_remote_airout = 0;
+static uint8_t cdc_stream_enabled = 0;
+static uint8_t pressure_sensor_valid = 0;
+static uint32_t cdc_last_control_tick = 0;
+static uint32_t cdc_last_stream_tick = 0;
+static uint32_t cdc_stream_period_ms = 20U;
+static float cdc_burst_drop_threshold_v = 0.08f;
+static float cdc_pressure_history[CDC_BURST_HISTORY_SIZE];
+static uint8_t cdc_pressure_history_count = 0;
+static uint8_t cdc_pressure_history_index = 0;
+static uint8_t cdc_burst_confirm_count = 0;
+
+/* =========================================================
  * СЧЁТЧИКИ
  * ========================================================= */
 
@@ -208,7 +240,10 @@ int main(void)
     dac.vref = 5.0f;
     dac.gain = 2.0f;
 
-    AD5328_Init(&dac);
+    if (AD5328_Init(&dac) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
     /* =====================================================
      * НАСТРОЙКА АЦП ADS1115
@@ -218,9 +253,9 @@ int main(void)
     adc.address = ADS1115_DEFAULT_ADDR;
 
     adc.pga = ADS1115_PGA_6_144V;
-    adc.data_rate = ADS1115_DR_128SPS;
+    adc.data_rate = ADS1115_DR_475SPS;
 
-    ADS1115_Init(&adc);
+    pressure_sensor_valid = (ADS1115_Init(&adc) == HAL_OK) ? 1U : 0U;
 
     /*
      * Начальное состояние выхода ITV.
@@ -242,11 +277,16 @@ int main(void)
          * ЧТЕНИЕ АНАЛОГОВЫХ ВХОДОВ
          * ================================================= */
 
-        ADS1115_ReadVoltageSingleEnded(
+        HAL_StatusTypeDef pressure_status = ADS1115_ReadVoltageSingleEnded(
             &adc,
             ADS1115_CHANNEL_0,
             &ITV_PRESSURE
         );
+
+        pressure_sensor_valid =
+            ((pressure_status == HAL_OK) &&
+             (ITV_PRESSURE >= ITV_SENSOR_MIN_VALID) &&
+             (ITV_PRESSURE <= ITV_SENSOR_MAX_VALID)) ? 1U : 0U;
 
         ADS1115_ReadVoltageSingleEnded(
             &adc,
@@ -260,15 +300,20 @@ int main(void)
             &REG_CARRIAGE
         );
 
-        /*
-         * REG_ITV временно отключён.
-         *
-         * ADS1115_ReadVoltageSingleEnded(
-         *     &adc,
-         *     ADS1115_CHANNEL_3,
-         *     &REG_ITV
-         * );
-         */
+        ADS1115_ReadVoltageSingleEnded(
+            &adc,
+            ADS1115_CHANNEL_3,
+            &REG_ITV
+        );
+
+        /* =================================================
+         * ОБРАБОТКА USB CDC И ЗАЩИТА ИСПЫТАНИЯ
+         * ================================================= */
+
+        MixerCDC_Process();
+        Motherboard_ProcessCDCCommands();
+        Motherboard_CDCSafetyTick();
+        Motherboard_CDCBurstDetection();
 
         /* =================================================
          * РЕГУЛИРОВАНИЕ ДАВЛЕНИЯ
@@ -280,13 +325,17 @@ int main(void)
          * ОБНОВЛЕНИЕ ЦАП
          * ================================================= */
 
-        AD5328_WriteABCD_Voltage(
-            &dac,
-            AIROUT,
-            REG_CAROUSEL * 2.0f,
-            CARRIAGE_SPEED,
-            0.8f
-        );
+        if (AD5328_WriteABCD_Voltage(
+                &dac,
+                AIROUT,
+                REG_CAROUSEL * 2.0f,
+                CARRIAGE_SPEED,
+                0.8f) != HAL_OK)
+        {
+            Motherboard_SafeAirOff();
+        }
+
+        Motherboard_SendCDCTelemetry();
 
         /* =================================================
          * ОБРАБОТКА SPI-КОМАНД
@@ -503,6 +552,12 @@ void ITV_PressureControl(void)
 {
     uint32_t current_tick = HAL_GetTick();
 
+    /* Во время испытания оболочки AIROUT задаётся программой напрямую. */
+    if (cdc_remote_airout != 0U)
+    {
+        return;
+    }
+
     /*
      * Запускаем регулирование раз в 20 мс.
      */
@@ -527,8 +582,7 @@ void ITV_PressureControl(void)
     /*
      * Защита от явно некорректного показания датчика.
      */
-    if ((ITV_PRESSURE < ITV_SENSOR_MIN_VALID) ||
-        (ITV_PRESSURE > ITV_SENSOR_MAX_VALID))
+    if (pressure_sensor_valid == 0U)
     {
         AIROUT = 0.0f;
         return;
@@ -629,6 +683,247 @@ void ITV_PressureControl(void)
 }
 
 /* =========================================================
+ * USB CDC / ИСПЫТАНИЕ ОБОЛОЧКИ
+ * ========================================================= */
+
+static void Motherboard_ProcessCDCCommands(void)
+{
+    MixerCDC_Command command;
+
+    while (MixerCDC_PopCommand(&command) != 0U)
+    {
+        switch (command.type)
+        {
+            case MIXER_CDC_CMD_AIR:
+                if (command.value >= 0.5f)
+                {
+                    if (pressure_sensor_valid != 0U)
+                    {
+                        Motherboard_SetAir(1U);
+                        cdc_last_control_tick = HAL_GetTick();
+                    }
+                    else
+                    {
+                        Motherboard_SafeAirOff();
+                    }
+                }
+                else
+                {
+                    Motherboard_SafeAirOff();
+                }
+                break;
+
+            case MIXER_CDC_CMD_AIROUT:
+                if (command.value < ITV_OUTPUT_MIN)
+                {
+                    command.value = ITV_OUTPUT_MIN;
+                }
+                else if (command.value > ITV_OUTPUT_MAX)
+                {
+                    command.value = ITV_OUTPUT_MAX;
+                }
+
+                AIROUT = command.value;
+                cdc_remote_airout = 1U;
+                cdc_last_control_tick = HAL_GetTick();
+                break;
+
+            case MIXER_CDC_CMD_STREAM_START:
+                if (command.period_ms < CDC_STREAM_PERIOD_MIN_MS)
+                {
+                    command.period_ms = CDC_STREAM_PERIOD_MIN_MS;
+                }
+                else if (command.period_ms > CDC_STREAM_PERIOD_MAX_MS)
+                {
+                    command.period_ms = CDC_STREAM_PERIOD_MAX_MS;
+                }
+
+                cdc_stream_period_ms = command.period_ms;
+                cdc_stream_enabled = 1U;
+                cdc_last_stream_tick = 0U;
+                break;
+
+            case MIXER_CDC_CMD_STREAM_STOP:
+                cdc_stream_enabled = 0U;
+                break;
+
+            case MIXER_CDC_CMD_DROP_THRESHOLD:
+                if ((command.value >= 0.02f) && (command.value <= 0.50f))
+                {
+                    cdc_burst_drop_threshold_v = command.value;
+                }
+                break;
+
+            case MIXER_CDC_CMD_PING:
+                cdc_last_control_tick = HAL_GetTick();
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+static void Motherboard_SetAir(uint8_t enabled)
+{
+    if (enabled != 0U)
+    {
+        if (pressure_sensor_valid == 0U)
+        {
+            Motherboard_SafeAirOff();
+            return;
+        }
+
+        bigairon = 1U;
+        HAL_GPIO_WritePin(
+            SMALLVALVE_CTRL_GPIO_Port,
+            SMALLVALVE_CTRL_Pin,
+            GPIO_PIN_SET
+        );
+        Motherboard_ResetBurstDetector();
+    }
+    else
+    {
+        Motherboard_SafeAirOff();
+    }
+}
+
+static void Motherboard_SafeAirOff(void)
+{
+    AIROUT = 0.0f;
+    bigairon = 0U;
+    cdc_remote_airout = 0U;
+
+    HAL_GPIO_WritePin(
+        SMALLVALVE_CTRL_GPIO_Port,
+        SMALLVALVE_CTRL_Pin,
+        GPIO_PIN_RESET
+    );
+    HAL_GPIO_WritePin(
+        BIGVALVE_CTRL_GPIO_Port,
+        BIGVALVE_CTRL_Pin,
+        GPIO_PIN_RESET
+    );
+}
+
+static void Motherboard_SafeStop(void)
+{
+    Motherboard_SafeAirOff();
+    carriage_stop();
+
+    HAL_GPIO_WritePin(
+        VF_FRW_CTRL_GPIO_Port,
+        VF_FRW_CTRL_Pin,
+        GPIO_PIN_RESET
+    );
+    HAL_GPIO_WritePin(
+        VF_REV_CTRL_GPIO_Port,
+        VF_REV_CTRL_Pin,
+        GPIO_PIN_RESET
+    );
+
+    g_state = STATE_IDLE;
+}
+
+static void Motherboard_CDCSafetyTick(void)
+{
+    if ((cdc_remote_airout == 0U) || (bigairon == 0U))
+    {
+        return;
+    }
+
+    if ((pressure_sensor_valid == 0U) ||
+        ((HAL_GetTick() - cdc_last_control_tick) > CDC_CONTROL_TIMEOUT_MS))
+    {
+        Motherboard_SafeAirOff();
+    }
+}
+
+static void Motherboard_CDCBurstDetection(void)
+{
+    float recent_peak = ITV_PRESSURE;
+    uint8_t index;
+
+    if ((cdc_remote_airout == 0U) ||
+        (bigairon == 0U) ||
+        (pressure_sensor_valid == 0U))
+    {
+        return;
+    }
+
+    for (index = 0U; index < cdc_pressure_history_count; index++)
+    {
+        if (cdc_pressure_history[index] > recent_peak)
+        {
+            recent_peak = cdc_pressure_history[index];
+        }
+    }
+
+    cdc_pressure_history[cdc_pressure_history_index] = ITV_PRESSURE;
+    cdc_pressure_history_index =
+        (uint8_t)((cdc_pressure_history_index + 1U) % CDC_BURST_HISTORY_SIZE);
+
+    if (cdc_pressure_history_count < CDC_BURST_HISTORY_SIZE)
+    {
+        cdc_pressure_history_count++;
+    }
+
+    if ((recent_peak >= (ITV_SENSOR_ZERO_V + CDC_BURST_MIN_RISE_V)) &&
+        ((recent_peak - ITV_PRESSURE) >= cdc_burst_drop_threshold_v))
+    {
+        cdc_burst_confirm_count++;
+    }
+    else
+    {
+        cdc_burst_confirm_count = 0U;
+    }
+
+    if (cdc_burst_confirm_count >= CDC_BURST_CONFIRM_SAMPLES)
+    {
+        Motherboard_SafeAirOff();
+    }
+}
+
+static void Motherboard_SendCDCTelemetry(void)
+{
+    uint32_t current_tick;
+
+    if (cdc_stream_enabled == 0U)
+    {
+        return;
+    }
+
+    current_tick = HAL_GetTick();
+    if ((current_tick - cdc_last_stream_tick) < cdc_stream_period_ms)
+    {
+        return;
+    }
+
+    cdc_last_stream_tick = current_tick;
+    MixerCDC_SendTelemetry(
+        ITV_PRESSURE,
+        REG_ITV,
+        AIROUT,
+        bigairon,
+        pressure_sensor_valid
+    );
+}
+
+static void Motherboard_ResetBurstDetector(void)
+{
+    uint8_t index;
+
+    cdc_pressure_history_count = 0U;
+    cdc_pressure_history_index = 0U;
+    cdc_burst_confirm_count = 0U;
+
+    for (index = 0U; index < CDC_BURST_HISTORY_SIZE; index++)
+    {
+        cdc_pressure_history[index] = ITV_SENSOR_ZERO_V;
+    }
+}
+
+/* =========================================================
  * SPI CALLBACK
  * ========================================================= */
 
@@ -681,34 +976,18 @@ void Motherboard_ProcessCommand(uint8_t cmd)
             break;
 
         case CMD_STOP:
-            g_state = STATE_IDLE;
+            Motherboard_SafeStop();
             break;
 
         case CMD_AIR:
             if (bigairon == 0)
             {
-                bigairon = 1;
-
-                HAL_GPIO_WritePin(
-                    SMALLVALVE_CTRL_GPIO_Port,
-                    SMALLVALVE_CTRL_Pin,
-                    GPIO_PIN_SET
-                );
+                cdc_remote_airout = 0U;
+                Motherboard_SetAir(1U);
             }
             else
             {
-                bigairon = 0;
-
-                /*
-                 * Немедленно выключаем выход ITV.
-                 */
-                AIROUT = 0.0f;
-
-                HAL_GPIO_WritePin(
-                    SMALLVALVE_CTRL_GPIO_Port,
-                    SMALLVALVE_CTRL_Pin,
-                    GPIO_PIN_RESET
-                );
+                Motherboard_SafeAirOff();
             }
             break;
 
@@ -848,7 +1127,7 @@ static void MX_I2C1_Init(void)
 {
     hi2c1.Instance = I2C1;
 
-    hi2c1.Init.ClockSpeed = 10000;
+    hi2c1.Init.ClockSpeed = 100000;
     hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
     hi2c1.Init.OwnAddress1 = 0;
 
