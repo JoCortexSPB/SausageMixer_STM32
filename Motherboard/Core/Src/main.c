@@ -31,6 +31,8 @@ static void Motherboard_CDCSafetyTick(void);
 static void Motherboard_CDCBurstDetection(void);
 static void Motherboard_SendCDCTelemetry(void);
 static void Motherboard_ResetBurstDetector(void);
+static void Motherboard_UpdatePressureTarget(void);
+static void Motherboard_UpdatePressureReady(void);
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -53,6 +55,7 @@ typedef enum
 {
     STATE_IDLE = 0,
     STATE_RUNNING = 1,
+    STATE_STOPPED = 2,
     STATE_ERROR = 10
 } MachineState_t;
 
@@ -68,28 +71,20 @@ typedef enum
  * НАСТРОЙКИ РЕГУЛИРОВАНИЯ ITV
  * ========================================================= */
 
-/*
- * Верхний предел давления.
- * Выше этого значения AIROUT уменьшается.
- */
-#define ITV_PRESSURE_MAX              0.425f
-
-/*
- * Нижняя граница рабочего диапазона.
- * Ниже этого значения AIROUT увеличивается.
- */
-#define ITV_PRESSURE_MIN              0.42f
-
-/*
- * Давление, при котором разрешается движение каретки.
- */
-#define ITV_PRESSURE_READY            0.390f
+#define REG_ITV_INPUT_MAX_V           5.0f
+#define WORK_PRESSURE_MAX_BAR         2.0f
+#define PRESSURE_SENSOR_FULL_BAR      10.0f
+#define PRESSURE_SENSOR_SPAN_V        1.60f
+#define PRESSURE_READY_TOLERANCE_V    0.008f
+#define PRESSURE_READY_RELEASE_V      0.016f
+#define PRESSURE_READY_STABLE_MS      300U
+#define ITV_CONTROL_DEADBAND_V        0.004f
 
 /*
  * Ограничения управляющего выхода ЦАП.
  */
 #define ITV_OUTPUT_MIN                0.0f
-#define ITV_OUTPUT_MAX                5.0f
+#define ITV_OUTPUT_MAX                10.0f
 
 /*
  * Период регулирования.
@@ -177,6 +172,10 @@ volatile uint8_t bigairon = 0;
  * Время последнего шага регулирования.
  */
 static uint32_t itv_control_tick = 0;
+static float itv_target_pressure_v = ITV_SENSOR_ZERO_V;
+static float itv_control_trim_v = 0.0f;
+static uint8_t pressure_ready = 0U;
+static uint32_t pressure_ready_since_tick = 0U;
 
 /* =========================================================
  * USB CDC / ИСПЫТАНИЕ ОБОЛОЧКИ
@@ -207,6 +206,12 @@ volatile float meter = 0.0f;
 volatile uint8_t metblock = 0;
 
 volatile uint8_t isCollected = 0;
+static uint8_t meter_pause_enabled = 1U;
+static float meter_pause_length_m = 10.0f;
+static uint8_t meter_pause_done = 0U;
+static uint8_t cycle_active = 0U;
+static uint32_t cycle_count = 0U;
+static uint32_t product_count = 0U;
 
 /* =========================================================
  * MAIN
@@ -238,7 +243,8 @@ int main(void)
     dac.ldac_pin = AD5328_LDAC_Pin;
 
     dac.vref = 5.0f;
-    dac.gain = 2.0f;
+    /* Внешний ОУ после AD5328 усиливает 0...5 В в 0...10 В. */
+    dac.output_gain = 2.0f;
 
     if (AD5328_Init(&dac) != HAL_OK)
     {
@@ -306,6 +312,8 @@ int main(void)
             &REG_ITV
         );
 
+        Motherboard_UpdatePressureTarget();
+
         /* =================================================
          * ОБРАБОТКА USB CDC И ЗАЩИТА ИСПЫТАНИЯ
          * ================================================= */
@@ -320,6 +328,7 @@ int main(void)
          * ================================================= */
 
         ITV_PressureControl();
+        Motherboard_UpdatePressureReady();
 
         /* =================================================
          * ОБНОВЛЕНИЕ ЦАП
@@ -396,7 +405,7 @@ int main(void)
          * ЛОГИКА СОСТОЯНИЙ
          * ================================================= */
 
-        if (g_state == STATE_IDLE)
+        if ((g_state == STATE_IDLE) || (g_state == STATE_STOPPED))
         {
             carriage_stop();
 
@@ -448,19 +457,17 @@ int main(void)
                     /*
                      * Включаем регулирование воздуха.
                      */
-                    bigairon = 1;
-
-                    HAL_GPIO_WritePin(
-                        SMALLVALVE_CTRL_GPIO_Port,
-                        SMALLVALVE_CTRL_Pin,
-                        GPIO_PIN_SET
-                    );
+                    if (bigairon == 0U)
+                    {
+                        cdc_remote_airout = 0U;
+                        Motherboard_SetAir(1U);
+                    }
 
                     /*
                      * Разрешаем движение после набора
                      * давления примерно до рабочего уровня.
                      */
-                    if (ITV_PRESSURE >= ITV_PRESSURE_READY)
+                    if (pressure_ready != 0U)
                     {
                         carriage_move_frw(REG_CARRIAGE);
 
@@ -481,11 +488,13 @@ int main(void)
                         );
                     }
 
-                    if ((meter >= 10.0f) &&
-                        (isCollected == 0))
+                    if ((meter_pause_enabled != 0U) &&
+                        (meter_pause_done == 0U) &&
+                        (meter >= meter_pause_length_m))
                     {
                         g_state = STATE_IDLE;
                         isCollected = 1;
+                        meter_pause_done = 1U;
                     }
                 }
                 else if (FARSENSOR == 1)
@@ -538,6 +547,10 @@ int main(void)
                     g_state = STATE_IDLE;
                     g_stage = STAGE_CYCLE;
                     meter = 0.0f;
+                    meter_pause_done = 0U;
+                    cycle_active = 0U;
+                    cycle_count++;
+                    product_count++;
                 }
             }
         }
@@ -551,6 +564,9 @@ int main(void)
 void ITV_PressureControl(void)
 {
     uint32_t current_tick = HAL_GetTick();
+    float feed_forward_v;
+    float error_v;
+    float step_v;
 
     /* Во время испытания оболочки AIROUT задаётся программой напрямую. */
     if (cdc_remote_airout != 0U)
@@ -576,6 +592,7 @@ void ITV_PressureControl(void)
     if (bigairon == 0)
     {
         AIROUT = 0.0f;
+        itv_control_trim_v = 0.0f;
         return;
     }
 
@@ -584,101 +601,100 @@ void ITV_PressureControl(void)
      */
     if (pressure_sensor_valid == 0U)
     {
-        AIROUT = 0.0f;
+        Motherboard_SafeStop();
+        g_state = STATE_ERROR;
         return;
     }
 
     /*
-     * Давление ниже рабочего диапазона.
-     * Увеличиваем AIROUT.
+     * REG_ITV 0...5 В соответствует настроенному диапазону ITV 0...2 бар.
+     * Поэтому базовое задание на вход ITV3010/3050 равно REG_ITV * 2.
+     * Обратная связь по FPSX добавляет небольшую интегральную коррекцию.
      */
-    if (ITV_PRESSURE < ITV_PRESSURE_MIN)
+    feed_forward_v = REG_ITV * (ITV_OUTPUT_MAX / REG_ITV_INPUT_MAX_V);
+    if (feed_forward_v < ITV_OUTPUT_MIN)
     {
-        float error;
-        float step_up;
+        feed_forward_v = ITV_OUTPUT_MIN;
+    }
+    else if (feed_forward_v > ITV_OUTPUT_MAX)
+    {
+        feed_forward_v = ITV_OUTPUT_MAX;
+    }
 
-        error = ITV_PRESSURE_MIN - ITV_PRESSURE;
+    error_v = itv_target_pressure_v - ITV_PRESSURE;
+    if (error_v > ITV_CONTROL_DEADBAND_V)
+    {
+        step_v = (error_v > 0.08f) ? 0.05f :
+                 (error_v > 0.03f) ? 0.02f : 0.005f;
+        itv_control_trim_v += step_v;
+    }
+    else if (error_v < -ITV_CONTROL_DEADBAND_V)
+    {
+        float excess_v = -error_v;
+        step_v = (excess_v > 0.08f) ? 0.05f :
+                 (excess_v > 0.03f) ? 0.02f : 0.005f;
+        itv_control_trim_v -= step_v;
+    }
 
-        /*
-         * При большом отставании даём быстрый набор.
-         * При приближении к рабочей точке уменьшаем шаг.
-         */
-        if (error > 0.20f)
-        {
-            step_up = 0.10f;
-        }
-        else if (error > 0.10f)
-        {
-            step_up = 0.05f;
-        }
-        else if (error > 0.03f)
-        {
-            step_up = 0.02f;
-        }
-        else if (error > 0.01f)
-        {
-            step_up = 0.01f;
-        }
-        else
-        {
-            step_up = 0.005f;
-        }
+    AIROUT = feed_forward_v + itv_control_trim_v;
+    if (AIROUT > ITV_OUTPUT_MAX)
+    {
+        AIROUT = ITV_OUTPUT_MAX;
+        itv_control_trim_v = AIROUT - feed_forward_v;
+    }
+    else if (AIROUT < ITV_OUTPUT_MIN)
+    {
+        AIROUT = ITV_OUTPUT_MIN;
+        itv_control_trim_v = AIROUT - feed_forward_v;
+    }
+}
 
-        AIROUT += step_up;
+static void Motherboard_UpdatePressureTarget(void)
+{
+    float reg_itv = REG_ITV;
 
-        if (AIROUT > ITV_OUTPUT_MAX)
+    if (reg_itv < 0.0f)
+    {
+        reg_itv = 0.0f;
+    }
+    else if (reg_itv > REG_ITV_INPUT_MAX_V)
+    {
+        reg_itv = REG_ITV_INPUT_MAX_V;
+    }
+
+    itv_target_pressure_v = ITV_SENSOR_ZERO_V +
+        (reg_itv / REG_ITV_INPUT_MAX_V) *
+        (WORK_PRESSURE_MAX_BAR / PRESSURE_SENSOR_FULL_BAR) *
+        PRESSURE_SENSOR_SPAN_V;
+}
+
+static void Motherboard_UpdatePressureReady(void)
+{
+    uint32_t current_tick = HAL_GetTick();
+
+    if ((bigairon == 0U) || (pressure_sensor_valid == 0U))
+    {
+        pressure_ready = 0U;
+        pressure_ready_since_tick = 0U;
+        return;
+    }
+
+    if ((ITV_PRESSURE + PRESSURE_READY_TOLERANCE_V) >= itv_target_pressure_v)
+    {
+        if (pressure_ready_since_tick == 0U)
         {
-            AIROUT = ITV_OUTPUT_MAX;
+            pressure_ready_since_tick = current_tick;
+        }
+        else if ((current_tick - pressure_ready_since_tick) >=
+                 PRESSURE_READY_STABLE_MS)
+        {
+            pressure_ready = 1U;
         }
     }
-    /*
-     * Давление выше 0.41.
-     * Не выключаем выход, а постепенно уменьшаем.
-     */
-    else if (ITV_PRESSURE > ITV_PRESSURE_MAX)
+    else if ((ITV_PRESSURE + PRESSURE_READY_RELEASE_V) < itv_target_pressure_v)
     {
-        float excess;
-        float step_down;
-
-        excess = ITV_PRESSURE - ITV_PRESSURE_MAX;
-
-        /*
-         * Чем сильнее превышение,
-         * тем быстрее снижаем выход.
-         */
-        if (excess > 0.10f)
-        {
-            step_down = 0.05f;
-        }
-        else if (excess > 0.03f)
-        {
-            step_down = 0.02f;
-        }
-        else if (excess > 0.01f)
-        {
-            step_down = 0.01f;
-        }
-        else
-        {
-            step_down = 0.005f;
-        }
-
-        AIROUT -= step_down;
-
-        if (AIROUT < ITV_OUTPUT_MIN)
-        {
-            AIROUT = ITV_OUTPUT_MIN;
-        }
-    }
-    else
-    {
-        /*
-         * Давление находится в диапазоне:
-         *
-         * 0.400 ... 0.410
-         *
-         * Текущее значение AIROUT сохраняется.
-         */
+        pressure_ready = 0U;
+        pressure_ready_since_tick = 0U;
     }
 }
 
@@ -694,6 +710,22 @@ static void Motherboard_ProcessCDCCommands(void)
     {
         switch (command.type)
         {
+            case MIXER_CDC_CMD_START:
+                Motherboard_ProcessCommand(CMD_START);
+                break;
+
+            case MIXER_CDC_CMD_STOP:
+                Motherboard_ProcessCommand(CMD_STOP);
+                break;
+
+            case MIXER_CDC_CMD_RESET:
+                Motherboard_ProcessCommand(CMD_RESET);
+                break;
+
+            case MIXER_CDC_CMD_LEFT:
+                Motherboard_ProcessCommand(CMD_LEFT);
+                break;
+
             case MIXER_CDC_CMD_AIR:
                 if (command.value >= 0.5f)
                 {
@@ -710,6 +742,25 @@ static void Motherboard_ProcessCDCCommands(void)
                 else
                 {
                     Motherboard_SafeAirOff();
+                }
+                break;
+
+            case MIXER_CDC_CMD_PAUSE_ENABLE:
+                meter_pause_enabled = (command.value >= 0.5f) ? 1U : 0U;
+                break;
+
+            case MIXER_CDC_CMD_PAUSE_LENGTH:
+                if ((command.value >= 0.1f) && (command.value <= 1000.0f))
+                {
+                    meter_pause_length_m = command.value;
+                }
+                break;
+
+            case MIXER_CDC_CMD_COUNTERS_RESET:
+                if (g_state != STATE_RUNNING)
+                {
+                    cycle_count = 0U;
+                    product_count = 0U;
                 }
                 break;
 
@@ -775,6 +826,12 @@ static void Motherboard_SetAir(uint8_t enabled)
         }
 
         bigairon = 1U;
+        itv_control_trim_v = 0.0f;
+        AIROUT = REG_ITV * (ITV_OUTPUT_MAX / REG_ITV_INPUT_MAX_V);
+        if (AIROUT > ITV_OUTPUT_MAX)
+        {
+            AIROUT = ITV_OUTPUT_MAX;
+        }
         HAL_GPIO_WritePin(
             SMALLVALVE_CTRL_GPIO_Port,
             SMALLVALVE_CTRL_Pin,
@@ -793,6 +850,9 @@ static void Motherboard_SafeAirOff(void)
     AIROUT = 0.0f;
     bigairon = 0U;
     cdc_remote_airout = 0U;
+    pressure_ready = 0U;
+    pressure_ready_since_tick = 0U;
+    itv_control_trim_v = 0.0f;
 
     HAL_GPIO_WritePin(
         SMALLVALVE_CTRL_GPIO_Port,
@@ -822,7 +882,7 @@ static void Motherboard_SafeStop(void)
         GPIO_PIN_RESET
     );
 
-    g_state = STATE_IDLE;
+    g_state = STATE_STOPPED;
 }
 
 static void Motherboard_CDCSafetyTick(void)
@@ -887,6 +947,7 @@ static void Motherboard_CDCBurstDetection(void)
 static void Motherboard_SendCDCTelemetry(void)
 {
     uint32_t current_tick;
+    MixerCDC_Telemetry telemetry;
 
     if (cdc_stream_enabled == 0U)
     {
@@ -900,13 +961,37 @@ static void Motherboard_SendCDCTelemetry(void)
     }
 
     cdc_last_stream_tick = current_tick;
-    MixerCDC_SendTelemetry(
-        ITV_PRESSURE,
-        REG_ITV,
-        AIROUT,
-        bigairon,
-        pressure_sensor_valid
-    );
+    telemetry.pressure_v = ITV_PRESSURE;
+    telemetry.pressure_target_v = itv_target_pressure_v;
+    telemetry.reg_itv_v = REG_ITV;
+    telemetry.reg_carousel_v = REG_CAROUSEL;
+    telemetry.reg_carriage_v = REG_CARRIAGE;
+    telemetry.airout_v = AIROUT;
+    telemetry.carriage_speed_v = CARRIAGE_SPEED;
+    telemetry.meter_m = meter;
+    telemetry.pause_length_m = meter_pause_length_m;
+    telemetry.cycle_count = cycle_count;
+    telemetry.product_count = product_count;
+    telemetry.bigairon = bigairon;
+    telemetry.pressure_valid = pressure_sensor_valid;
+    telemetry.pressure_ready = pressure_ready;
+    telemetry.state = g_state;
+    telemetry.stage = g_stage;
+    telemetry.pause_enabled = meter_pause_enabled;
+    telemetry.sensors =
+        (HOMESENSOR ? 0x01U : 0U) |
+        (CNTSENSOR ? 0x02U : 0U) |
+        (NEARSENSOR ? 0x04U : 0U) |
+        (FARSENSOR ? 0x08U : 0U);
+    telemetry.carriage_on = HAL_GPIO_ReadPin(
+        SRV_ON_CTRL_GPIO_Port, SRV_ON_CTRL_Pin) ? 1U : 0U;
+    telemetry.vf_forward = HAL_GPIO_ReadPin(
+        VF_FRW_CTRL_GPIO_Port, VF_FRW_CTRL_Pin) ? 1U : 0U;
+    telemetry.vf_reverse = HAL_GPIO_ReadPin(
+        VF_REV_CTRL_GPIO_Port, VF_REV_CTRL_Pin) ? 1U : 0U;
+    telemetry.cycle_active = cycle_active;
+
+    MixerCDC_SendTelemetry(&telemetry);
 }
 
 static void Motherboard_ResetBurstDetector(void)
@@ -972,7 +1057,16 @@ void Motherboard_ProcessCommand(uint8_t cmd)
     switch (cmd)
     {
         case CMD_START:
-            g_state = STATE_RUNNING;
+            if (g_state != STATE_ERROR)
+            {
+                if ((g_stage == STAGE_CYCLE) && (cycle_active == 0U))
+                {
+                    cycle_active = 1U;
+                    meter_pause_done = 0U;
+                }
+
+                g_state = STATE_RUNNING;
+            }
             break;
 
         case CMD_STOP:
@@ -992,13 +1086,23 @@ void Motherboard_ProcessCommand(uint8_t cmd)
             break;
 
         case CMD_RESET:
+            /*
+             * RESET is a safe reinitialisation of the scenario, not an MCU
+             * reset: first remove every actuator command, then return the
+             * state machine to the homing stage. Production counters survive.
+             */
+            Motherboard_SafeStop();
             g_stage = STAGE_NOINIT;
             meter = 0.0f;
             isCollected = 0;
+            meter_pause_done = 0U;
+            cycle_active = 0U;
+            g_state = STATE_IDLE;
             break;
 
         case CMD_LEFT:
-            if ((HAL_GPIO_ReadPin(
+            if ((g_state != STATE_RUNNING) &&
+                (HAL_GPIO_ReadPin(
                     VF_FRW_CTRL_GPIO_Port,
                     VF_FRW_CTRL_Pin) == 0) &&
                 (HAL_GPIO_ReadPin(
@@ -1024,14 +1128,9 @@ void Motherboard_ProcessCommand(uint8_t cmd)
             break;
 
         case CMD_RIGHT:
-            break;
-
         case CMD_UP:
-            g_CarriageDirection = 1;
-            break;
-
         case CMD_DOWN:
-            g_CarriageDirection = 0;
+            /* Reserved physical keys; intentionally inactive for now. */
             break;
 
         default:

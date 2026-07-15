@@ -110,27 +110,60 @@ uint8_t MixerCDC_PopCommand(MixerCDC_Command *command)
     return 1U;
 }
 
-uint8_t MixerCDC_SendTelemetry(
-    float pressure_v,
-    float reg_itv_v,
-    float airout_v,
-    uint8_t bigairon,
-    uint8_t pressure_valid
-)
+uint8_t MixerCDC_SendTelemetry(const MixerCDC_Telemetry *telemetry)
 {
-    static uint8_t message[64];
+    static uint8_t message[160];
     uint16_t length = 0U;
 
+    if (telemetry == NULL)
+    {
+        return 1U;
+    }
+
     length = MixerCDC_AppendText(message, length, "TEL,");
-    length = MixerCDC_AppendVoltage(message, length, pressure_v);
+    length = MixerCDC_AppendVoltage(message, length, telemetry->pressure_v);
     message[length++] = ',';
-    length = MixerCDC_AppendVoltage(message, length, reg_itv_v);
+    length = MixerCDC_AppendVoltage(message, length, telemetry->pressure_target_v);
     message[length++] = ',';
-    length = MixerCDC_AppendVoltage(message, length, airout_v);
+    length = MixerCDC_AppendVoltage(message, length, telemetry->reg_itv_v);
     message[length++] = ',';
-    message[length++] = bigairon ? '1' : '0';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->reg_carousel_v);
     message[length++] = ',';
-    message[length++] = pressure_valid ? '1' : '0';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->reg_carriage_v);
+    message[length++] = ',';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->airout_v);
+    message[length++] = ',';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->carriage_speed_v);
+    message[length++] = ',';
+    message[length++] = telemetry->bigairon ? '1' : '0';
+    message[length++] = ',';
+    message[length++] = telemetry->pressure_valid ? '1' : '0';
+    message[length++] = ',';
+    message[length++] = telemetry->pressure_ready ? '1' : '0';
+    message[length++] = ',';
+    length = MixerCDC_AppendUnsigned(message, length, telemetry->state);
+    message[length++] = ',';
+    length = MixerCDC_AppendUnsigned(message, length, telemetry->stage);
+    message[length++] = ',';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->meter_m);
+    message[length++] = ',';
+    length = MixerCDC_AppendUnsigned(message, length, telemetry->cycle_count);
+    message[length++] = ',';
+    length = MixerCDC_AppendUnsigned(message, length, telemetry->product_count);
+    message[length++] = ',';
+    message[length++] = telemetry->pause_enabled ? '1' : '0';
+    message[length++] = ',';
+    length = MixerCDC_AppendVoltage(message, length, telemetry->pause_length_m);
+    message[length++] = ',';
+    length = MixerCDC_AppendUnsigned(message, length, telemetry->sensors);
+    message[length++] = ',';
+    message[length++] = telemetry->carriage_on ? '1' : '0';
+    message[length++] = ',';
+    message[length++] = telemetry->vf_forward ? '1' : '0';
+    message[length++] = ',';
+    message[length++] = telemetry->vf_reverse ? '1' : '0';
+    message[length++] = ',';
+    message[length++] = telemetry->cycle_active ? '1' : '0';
     message[length++] = '\n';
 
     return CDC_Transmit_FS(message, length);
@@ -140,7 +173,54 @@ static void MixerCDC_ParseLine(char *line)
 {
     MixerCDC_Command command = {0};
 
-    if (strcmp(line, "AIR,1") == 0)
+    if (strcmp(line, "START") == 0)
+    {
+        command.type = MIXER_CDC_CMD_START;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "STOP") == 0)
+    {
+        command.type = MIXER_CDC_CMD_STOP;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "RESET") == 0)
+    {
+        command.type = MIXER_CDC_CMD_RESET;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "LEFT") == 0)
+    {
+        command.type = MIXER_CDC_CMD_LEFT;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "COUNTERS,RESET") == 0)
+    {
+        command.type = MIXER_CDC_CMD_COUNTERS_RESET;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "PAUSE,1") == 0)
+    {
+        command.type = MIXER_CDC_CMD_PAUSE_ENABLE;
+        command.value = 1.0f;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "PAUSE,0") == 0)
+    {
+        command.type = MIXER_CDC_CMD_PAUSE_ENABLE;
+        command.value = 0.0f;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strncmp(line, "LENGTH,", 7U) == 0)
+    {
+        float value;
+        if (MixerCDC_ParseVoltage(&line[7], &value) != 0U)
+        {
+            command.type = MIXER_CDC_CMD_PAUSE_LENGTH;
+            command.value = value;
+            MixerCDC_PushCommand(&command);
+        }
+    }
+    else if (strcmp(line, "AIR,1") == 0)
     {
         command.type = MIXER_CDC_CMD_AIR;
         command.value = 1.0f;
@@ -215,9 +295,9 @@ static uint32_t MixerCDC_VoltageToMillivolts(float voltage)
         return 0U;
     }
 
-    if (voltage >= 20.0f)
+    if (voltage >= 100000.0f)
     {
-        return 20000U;
+        return 100000000U;
     }
 
     return (uint32_t)(voltage * 1000.0f + 0.5f);

@@ -18,30 +18,6 @@ static HAL_StatusTypeDef AD5328_SendWord(AD5328_HandleTypeDef *dev, uint16_t wor
     return status;
 }
 
-/*HAL_StatusTypeDef AD5328_Init(AD5328_HandleTypeDef *dev)
-{
-    if (dev == 0 || dev->hspi == 0)
-    {
-        return HAL_ERROR;
-    }
-
-    HAL_GPIO_WritePin(dev->sync_port, dev->sync_pin, GPIO_PIN_SET);
-
-
-    HAL_GPIO_WritePin(dev->ldac_port, dev->ldac_pin, GPIO_PIN_SET);
-
-    HAL_StatusTypeDef status;
-
-    status = AD5328_ResetDataAndControl(dev);
-    if (status != HAL_OK) return status;
-
-
-        status = AD5328_SetGainABCD_X2(dev);
-        if (status != HAL_OK) return status;
-
-        return HAL_OK;
-}*/
-
 HAL_StatusTypeDef AD5328_Init(AD5328_HandleTypeDef *dev)
 {
     if (dev == 0 || dev->hspi == 0)
@@ -61,7 +37,11 @@ HAL_StatusTypeDef AD5328_Init(AD5328_HandleTypeDef *dev)
     status = AD5328_ResetDataAndControl(dev);
     if (status != HAL_OK) return status;
 
-    status = AD5328_SetGainABCD_X2(dev);
+    /*
+     * Сам AD5328 формирует 0...VREF. Внешний ОУ платы усиливает выход x2,
+     * поэтому внутренний gain x2 включать нельзя.
+     */
+    status = AD5328_SetGainABCD_X1(dev);
     if (status != HAL_OK) return status;
 
     return HAL_OK;
@@ -102,7 +82,8 @@ HAL_StatusTypeDef AD5328_WriteVoltage(
     float voltage
 )
 {
-    float full_scale = dev->vref * dev->gain;
+    /* voltage — требуемое напряжение после внешнего усилителя. */
+    float full_scale = dev->vref * dev->output_gain;
 
     if (voltage < 0.0f)
     {

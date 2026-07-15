@@ -27,7 +27,8 @@ typedef struct
     uint16_t ldac_pin;
 
     float vref;
-    float gain;
+    /* Усиление внешнего ОУ после ЦАП; напряжения API заданы после ОУ. */
+    float output_gain;
 } AD5328_HandleTypeDef;
 
 HAL_StatusTypeDef AD5328_Init(AD5328_HandleTypeDef *dev);
