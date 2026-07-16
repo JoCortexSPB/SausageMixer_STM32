@@ -8,6 +8,7 @@ C_SRCS += \
 ../Core/Src/ad5328.c \
 ../Core/Src/ads1115.c \
 ../Core/Src/main.c \
+../Core/Src/mixer_cdc.c \
 ../Core/Src/stm32f1xx_hal_msp.c \
 ../Core/Src/stm32f1xx_hal_tim.c \
 ../Core/Src/stm32f1xx_hal_tim_ex.c \
@@ -20,6 +21,7 @@ OBJS += \
 ./Core/Src/ad5328.o \
 ./Core/Src/ads1115.o \
 ./Core/Src/main.o \
+./Core/Src/mixer_cdc.o \
 ./Core/Src/stm32f1xx_hal_msp.o \
 ./Core/Src/stm32f1xx_hal_tim.o \
 ./Core/Src/stm32f1xx_hal_tim_ex.o \
@@ -32,6 +34,7 @@ C_DEPS += \
 ./Core/Src/ad5328.d \
 ./Core/Src/ads1115.d \
 ./Core/Src/main.d \
+./Core/Src/mixer_cdc.d \
 ./Core/Src/stm32f1xx_hal_msp.d \
 ./Core/Src/stm32f1xx_hal_tim.d \
 ./Core/Src/stm32f1xx_hal_tim_ex.d \
@@ -48,7 +51,7 @@ Core/Src/%.o Core/Src/%.su Core/Src/%.cyclo: ../Core/Src/%.c Core/Src/subdir.mk
 clean: clean-Core-2f-Src
 
 clean-Core-2f-Src:
-	-$(RM) ./Core/Src/ad5328.cyclo ./Core/Src/ad5328.d ./Core/Src/ad5328.o ./Core/Src/ad5328.su ./Core/Src/ads1115.cyclo ./Core/Src/ads1115.d ./Core/Src/ads1115.o ./Core/Src/ads1115.su ./Core/Src/main.cyclo ./Core/Src/main.d ./Core/Src/main.o ./Core/Src/main.su ./Core/Src/stm32f1xx_hal_msp.cyclo ./Core/Src/stm32f1xx_hal_msp.d ./Core/Src/stm32f1xx_hal_msp.o ./Core/Src/stm32f1xx_hal_msp.su ./Core/Src/stm32f1xx_hal_tim.cyclo ./Core/Src/stm32f1xx_hal_tim.d ./Core/Src/stm32f1xx_hal_tim.o ./Core/Src/stm32f1xx_hal_tim.su ./Core/Src/stm32f1xx_hal_tim_ex.cyclo ./Core/Src/stm32f1xx_hal_tim_ex.d ./Core/Src/stm32f1xx_hal_tim_ex.o ./Core/Src/stm32f1xx_hal_tim_ex.su ./Core/Src/stm32f1xx_it.cyclo ./Core/Src/stm32f1xx_it.d ./Core/Src/stm32f1xx_it.o ./Core/Src/stm32f1xx_it.su ./Core/Src/syscalls.cyclo ./Core/Src/syscalls.d ./Core/Src/syscalls.o ./Core/Src/syscalls.su ./Core/Src/sysmem.cyclo ./Core/Src/sysmem.d ./Core/Src/sysmem.o ./Core/Src/sysmem.su ./Core/Src/system_stm32f1xx.cyclo ./Core/Src/system_stm32f1xx.d ./Core/Src/system_stm32f1xx.o ./Core/Src/system_stm32f1xx.su
+	-$(RM) ./Core/Src/ad5328.cyclo ./Core/Src/ad5328.d ./Core/Src/ad5328.o ./Core/Src/ad5328.su ./Core/Src/ads1115.cyclo ./Core/Src/ads1115.d ./Core/Src/ads1115.o ./Core/Src/ads1115.su ./Core/Src/main.cyclo ./Core/Src/main.d ./Core/Src/main.o ./Core/Src/main.su ./Core/Src/mixer_cdc.cyclo ./Core/Src/mixer_cdc.d ./Core/Src/mixer_cdc.o ./Core/Src/mixer_cdc.su ./Core/Src/stm32f1xx_hal_msp.cyclo ./Core/Src/stm32f1xx_hal_msp.d ./Core/Src/stm32f1xx_hal_msp.o ./Core/Src/stm32f1xx_hal_msp.su ./Core/Src/stm32f1xx_hal_tim.cyclo ./Core/Src/stm32f1xx_hal_tim.d ./Core/Src/stm32f1xx_hal_tim.o ./Core/Src/stm32f1xx_hal_tim.su ./Core/Src/stm32f1xx_hal_tim_ex.cyclo ./Core/Src/stm32f1xx_hal_tim_ex.d ./Core/Src/stm32f1xx_hal_tim_ex.o ./Core/Src/stm32f1xx_hal_tim_ex.su ./Core/Src/stm32f1xx_it.cyclo ./Core/Src/stm32f1xx_it.d ./Core/Src/stm32f1xx_it.o ./Core/Src/stm32f1xx_it.su ./Core/Src/syscalls.cyclo ./Core/Src/syscalls.d ./Core/Src/syscalls.o ./Core/Src/syscalls.su ./Core/Src/sysmem.cyclo ./Core/Src/sysmem.d ./Core/Src/sysmem.o ./Core/Src/sysmem.su ./Core/Src/system_stm32f1xx.cyclo ./Core/Src/system_stm32f1xx.d ./Core/Src/system_stm32f1xx.o ./Core/Src/system_stm32f1xx.su
 
 .PHONY: clean-Core-2f-Src
 
