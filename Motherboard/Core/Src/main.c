@@ -1,5 +1,7 @@
 #include "main.h"
 #include "usb_device.h"
+#include "usbd_cdc_if.h"
+#include <stdio.h>
 #include <string.h>
 
 #include "ADS1115.h"
@@ -22,6 +24,10 @@ ADS1115_HandleTypeDef adc;
  * ========================================================= */
 
 void Motherboard_ProcessCommand(uint8_t cmd);
+static void Motherboard_ProcessCDC(void);
+static void Motherboard_SendCDCTelemetry(void);
+static void Motherboard_HandleCDCLine(char *line);
+static uint32_t Motherboard_VoltageToMillivolts(float voltage);
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -94,6 +100,13 @@ typedef enum
 #define ITV_SENSOR_MIN_VALID          0.35f
 #define ITV_SENSOR_MAX_VALID          2.05f
 
+#define CDC_PROTOCOL_VERSION          3U
+#define CDC_RX_BUFFER_SIZE            256U
+#define CDC_LINE_BUFFER_SIZE          64U
+#define CDC_STREAM_PERIOD_DEFAULT_MS  50U
+#define CDC_STREAM_PERIOD_MIN_MS      20U
+#define CDC_STREAM_PERIOD_MAX_MS      1000U
+
 /* =========================================================
  * АНАЛОГОВЫЕ СИГНАЛЫ
  * ========================================================= */
@@ -159,6 +172,18 @@ volatile uint8_t bigairon = 0;
  */
 static uint32_t itv_control_tick = 0;
 static float itv_integral_v = 0.0f;
+static float itv_target_pressure_v = PRESSURE_SENSOR_ZERO_V;
+
+/* =========================================================
+ * USB CDC
+ * ========================================================= */
+
+static volatile uint8_t cdc_rx_buffer[CDC_RX_BUFFER_SIZE];
+static volatile uint16_t cdc_rx_write_index = 0U;
+static volatile uint16_t cdc_rx_read_index = 0U;
+static uint8_t cdc_stream_enabled = 0U;
+static uint32_t cdc_stream_period_ms = CDC_STREAM_PERIOD_DEFAULT_MS;
+static uint32_t cdc_stream_tick = 0U;
 
 /* =========================================================
  * СЧЁТЧИКИ
@@ -263,6 +288,8 @@ int main(void)
             ADS1115_CHANNEL_3,
             &REG_ITV
         );
+
+        Motherboard_ProcessCDC();
 
         /* =================================================
          * РЕГУЛИРОВАНИЕ ДАВЛЕНИЯ
@@ -486,6 +513,8 @@ int main(void)
                 }
             }
         }
+
+        Motherboard_SendCDCTelemetry();
     }
 }
 
@@ -498,7 +527,6 @@ void ITV_PressureControl(void)
     uint32_t current_tick = HAL_GetTick();
     uint32_t elapsed_ms = current_tick - itv_control_tick;
     float reg_itv;
-    float target_pressure_v;
     float error_v;
     float proportional_v;
     float candidate_v;
@@ -510,6 +538,21 @@ void ITV_PressureControl(void)
     }
 
     itv_control_tick = current_tick;
+
+    reg_itv = REG_ITV;
+    if (reg_itv < 0.0f)
+    {
+        reg_itv = 0.0f;
+    }
+    else if (reg_itv > REG_ITV_INPUT_MAX_V)
+    {
+        reg_itv = REG_ITV_INPUT_MAX_V;
+    }
+
+    itv_target_pressure_v = PRESSURE_SENSOR_ZERO_V +
+        (reg_itv / REG_ITV_INPUT_MAX_V) *
+        (WORK_PRESSURE_MAX_BAR / PRESSURE_SENSOR_FULL_BAR) *
+        PRESSURE_SENSOR_SPAN_V;
 
     if (bigairon == 0)
     {
@@ -526,22 +569,7 @@ void ITV_PressureControl(void)
         return;
     }
 
-    reg_itv = REG_ITV;
-    if (reg_itv < 0.0f)
-    {
-        reg_itv = 0.0f;
-    }
-    else if (reg_itv > REG_ITV_INPUT_MAX_V)
-    {
-        reg_itv = REG_ITV_INPUT_MAX_V;
-    }
-
-    target_pressure_v = PRESSURE_SENSOR_ZERO_V +
-        (reg_itv / REG_ITV_INPUT_MAX_V) *
-        (WORK_PRESSURE_MAX_BAR / PRESSURE_SENSOR_FULL_BAR) *
-        PRESSURE_SENSOR_SPAN_V;
-
-    error_v = target_pressure_v - ITV_PRESSURE;
+    error_v = itv_target_pressure_v - ITV_PRESSURE;
     if ((error_v > -ITV_CONTROL_DEADBAND_V) &&
         (error_v < ITV_CONTROL_DEADBAND_V))
     {
@@ -578,6 +606,198 @@ void ITV_PressureControl(void)
     {
         AIROUT = ITV_OUTPUT_MIN;
     }
+}
+
+/* =========================================================
+ * USB CDC
+ * ========================================================= */
+
+void Motherboard_CDCReceive(const uint8_t *data, uint32_t length)
+{
+    uint32_t index;
+
+    for (index = 0U; index < length; index++)
+    {
+        uint16_t next_index =
+            (uint16_t)((cdc_rx_write_index + 1U) % CDC_RX_BUFFER_SIZE);
+
+        if (next_index == cdc_rx_read_index)
+        {
+            break;
+        }
+
+        cdc_rx_buffer[cdc_rx_write_index] = data[index];
+        cdc_rx_write_index = next_index;
+    }
+}
+
+static void Motherboard_ProcessCDC(void)
+{
+    static char line[CDC_LINE_BUFFER_SIZE];
+    static uint16_t line_length = 0U;
+
+    while (cdc_rx_read_index != cdc_rx_write_index)
+    {
+        uint8_t value = cdc_rx_buffer[cdc_rx_read_index];
+        cdc_rx_read_index =
+            (uint16_t)((cdc_rx_read_index + 1U) % CDC_RX_BUFFER_SIZE);
+
+        if (value == '\r')
+        {
+            continue;
+        }
+
+        if (value == '\n')
+        {
+            line[line_length] = '\0';
+            if (line_length > 0U)
+            {
+                Motherboard_HandleCDCLine(line);
+            }
+            line_length = 0U;
+        }
+        else if (line_length < (CDC_LINE_BUFFER_SIZE - 1U))
+        {
+            line[line_length++] = (char)value;
+        }
+        else
+        {
+            line_length = 0U;
+        }
+    }
+}
+
+static void Motherboard_HandleCDCLine(char *line)
+{
+    static const uint8_t protocol_message[] = "PROTO,3\n";
+    unsigned long requested_period;
+
+    if (strcmp(line, "VERSION") == 0)
+    {
+        CDC_Transmit_FS((uint8_t *)protocol_message,
+                        (uint16_t)(sizeof(protocol_message) - 1U));
+    }
+    else if (sscanf(line, "STREAM,START,%lu", &requested_period) == 1)
+    {
+        if (requested_period < CDC_STREAM_PERIOD_MIN_MS)
+        {
+            requested_period = CDC_STREAM_PERIOD_MIN_MS;
+        }
+        else if (requested_period > CDC_STREAM_PERIOD_MAX_MS)
+        {
+            requested_period = CDC_STREAM_PERIOD_MAX_MS;
+        }
+
+        cdc_stream_period_ms = (uint32_t)requested_period;
+        cdc_stream_enabled = 1U;
+        cdc_stream_tick = 0U;
+        CDC_Transmit_FS((uint8_t *)protocol_message,
+                        (uint16_t)(sizeof(protocol_message) - 1U));
+    }
+    else if (strcmp(line, "STREAM,STOP") == 0)
+    {
+        cdc_stream_enabled = 0U;
+    }
+    else if (strcmp(line, "START") == 0)
+    {
+        Motherboard_ProcessCommand(CMD_START);
+    }
+    else if (strcmp(line, "STOP") == 0)
+    {
+        Motherboard_ProcessCommand(CMD_STOP);
+    }
+    else if (strcmp(line, "RESET") == 0)
+    {
+        Motherboard_ProcessCommand(CMD_RESET);
+    }
+    else if (strcmp(line, "LEFT") == 0)
+    {
+        Motherboard_ProcessCommand(CMD_LEFT);
+    }
+    else if (strcmp(line, "AIR") == 0)
+    {
+        Motherboard_ProcessCommand(CMD_AIR);
+    }
+    else if (strcmp(line, "AIR,1") == 0)
+    {
+        if (bigairon == 0U)
+        {
+            Motherboard_ProcessCommand(CMD_AIR);
+        }
+    }
+    else if (strcmp(line, "AIR,0") == 0)
+    {
+        if (bigairon != 0U)
+        {
+            Motherboard_ProcessCommand(CMD_AIR);
+        }
+    }
+}
+
+static void Motherboard_SendCDCTelemetry(void)
+{
+    static uint8_t message[192];
+    uint32_t current_tick;
+    uint8_t pressure_valid;
+    uint8_t sensors;
+    int length;
+
+    if (cdc_stream_enabled == 0U)
+    {
+        return;
+    }
+
+    current_tick = HAL_GetTick();
+    if ((current_tick - cdc_stream_tick) < cdc_stream_period_ms)
+    {
+        return;
+    }
+    cdc_stream_tick = current_tick;
+
+    pressure_valid =
+        ((ITV_PRESSURE >= ITV_SENSOR_MIN_VALID) &&
+         (ITV_PRESSURE <= ITV_SENSOR_MAX_VALID)) ? 1U : 0U;
+    sensors =
+        (HOMESENSOR ? 0x01U : 0U) |
+        (CNTSENSOR ? 0x02U : 0U) |
+        (NEARSENSOR ? 0x04U : 0U) |
+        (FARSENSOR ? 0x08U : 0U);
+
+    length = snprintf(
+        (char *)message,
+        sizeof(message),
+        "TEL,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%lu,%u,%u,%u,%u\n",
+        (unsigned long)Motherboard_VoltageToMillivolts(ITV_PRESSURE),
+        (unsigned long)Motherboard_VoltageToMillivolts(itv_target_pressure_v),
+        (unsigned long)Motherboard_VoltageToMillivolts(REG_ITV),
+        (unsigned long)Motherboard_VoltageToMillivolts(AIROUT * 2.0f),
+        (unsigned int)bigairon,
+        (unsigned int)pressure_valid,
+        (unsigned int)g_state,
+        (unsigned int)g_stage,
+        (unsigned long)((meter > 0.0f) ? (meter * 1000.0f + 0.5f) : 0.0f),
+        (unsigned int)sensors,
+        (unsigned int)(HAL_GPIO_ReadPin(
+            SRV_ON_CTRL_GPIO_Port, SRV_ON_CTRL_Pin) ? 1U : 0U),
+        (unsigned int)(HAL_GPIO_ReadPin(
+            VF_FRW_CTRL_GPIO_Port, VF_FRW_CTRL_Pin) ? 1U : 0U),
+        (unsigned int)(HAL_GPIO_ReadPin(
+            VF_REV_CTRL_GPIO_Port, VF_REV_CTRL_Pin) ? 1U : 0U));
+
+    if ((length > 0) && ((uint32_t)length < sizeof(message)))
+    {
+        CDC_Transmit_FS(message, (uint16_t)length);
+    }
+}
+
+static uint32_t Motherboard_VoltageToMillivolts(float voltage)
+{
+    if (voltage <= 0.0f)
+    {
+        return 0U;
+    }
+
+    return (uint32_t)(voltage * 1000.0f + 0.5f);
 }
 
 /* =========================================================
