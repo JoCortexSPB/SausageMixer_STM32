@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define MIXER_CDC_PROTOCOL_VERSION 2U
+
 typedef enum
 {
     MIXER_CDC_CMD_NONE = 0,
@@ -18,6 +20,7 @@ typedef enum
     MIXER_CDC_CMD_PAUSE_ENABLE,
     MIXER_CDC_CMD_PAUSE_LENGTH,
     MIXER_CDC_CMD_COUNTERS_RESET,
+    MIXER_CDC_CMD_VERSION,
     MIXER_CDC_CMD_PING
 } MixerCDC_CommandType;
 
@@ -65,6 +68,8 @@ typedef struct
 uint8_t MixerCDC_SendTelemetry(
     const MixerCDC_Telemetry *telemetry
 );
+
+uint8_t MixerCDC_SendProtocolInfo(void);
 
 extern volatile uint32_t mixer_cdc_rx_overflow_count;
 extern volatile uint32_t mixer_cdc_command_overflow_count;

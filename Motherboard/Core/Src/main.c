@@ -764,6 +764,10 @@ static void Motherboard_ProcessCDCCommands(void)
                 }
                 break;
 
+            case MIXER_CDC_CMD_VERSION:
+                MixerCDC_SendProtocolInfo();
+                break;
+
             case MIXER_CDC_CMD_AIROUT:
                 if (command.value < ITV_OUTPUT_MIN)
                 {
@@ -792,6 +796,7 @@ static void Motherboard_ProcessCDCCommands(void)
                 cdc_stream_period_ms = command.period_ms;
                 cdc_stream_enabled = 1U;
                 cdc_last_stream_tick = 0U;
+                MixerCDC_SendProtocolInfo();
                 break;
 
             case MIXER_CDC_CMD_STREAM_STOP:

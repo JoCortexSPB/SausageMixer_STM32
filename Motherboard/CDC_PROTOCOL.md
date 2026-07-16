@@ -4,6 +4,9 @@ USB CDC uses ASCII lines terminated by `\n`. Commands are accepted both from
 MixerMonitor and from the physical keyboard through the same state-machine entry
 point, so the two control surfaces have identical semantics.
 
+Current protocol version is `2`. `VERSION` returns `PROTO,2` and starting the
+telemetry stream also emits the same identification line.
+
 ## Machine commands
 
 ```text
@@ -17,6 +20,7 @@ PAUSE,1
 PAUSE,0
 LENGTH,10.000
 COUNTERS,RESET
+VERSION
 ```
 
 - `START` starts or resumes the current state-machine stage.

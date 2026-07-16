@@ -169,11 +169,22 @@ uint8_t MixerCDC_SendTelemetry(const MixerCDC_Telemetry *telemetry)
     return CDC_Transmit_FS(message, length);
 }
 
+uint8_t MixerCDC_SendProtocolInfo(void)
+{
+    static uint8_t message[] = "PROTO,2\n";
+    return CDC_Transmit_FS(message, (uint16_t)(sizeof(message) - 1U));
+}
+
 static void MixerCDC_ParseLine(char *line)
 {
     MixerCDC_Command command = {0};
 
-    if (strcmp(line, "START") == 0)
+    if (strcmp(line, "VERSION") == 0)
+    {
+        command.type = MIXER_CDC_CMD_VERSION;
+        MixerCDC_PushCommand(&command);
+    }
+    else if (strcmp(line, "START") == 0)
     {
         command.type = MIXER_CDC_CMD_START;
         MixerCDC_PushCommand(&command);
