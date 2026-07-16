@@ -59,17 +59,18 @@ typedef enum
  * НАСТРОЙКИ РЕГУЛИРОВАНИЯ ITV
  * ========================================================= */
 
-/*
- * Верхний предел давления.
- * Выше этого значения AIROUT уменьшается.
- */
-#define ITV_PRESSURE_MAX              0.425f
+/* REG_ITV 0...5 В задаёт рабочее давление 0...2 бар. */
+#define REG_ITV_INPUT_MAX_V           5.0f
+#define WORK_PRESSURE_MAX_BAR         2.0f
+#define PRESSURE_SENSOR_FULL_BAR      10.0f
+#define PRESSURE_SENSOR_ZERO_V        0.40f
+#define PRESSURE_SENSOR_SPAN_V        1.60f
 
-/*
- * Нижняя граница рабочего диапазона.
- * Ниже этого значения AIROUT увеличивается.
- */
-#define ITV_PRESSURE_MIN              0.42f
+/* Быстрая PI-коррекция прямого задания REG_ITV -> AIROUT. */
+#define ITV_CONTROL_KP                12.0f
+#define ITV_CONTROL_KI                6.0f
+#define ITV_CONTROL_DEADBAND_V        0.0015f
+#define ITV_INTEGRAL_LIMIT_V          2.0f
 
 /*
  * Давление, при котором разрешается движение каретки.
@@ -85,24 +86,20 @@ typedef enum
 /*
  * Период регулирования.
  */
-#define ITV_CONTROL_PERIOD_MS         20U
+#define ITV_CONTROL_PERIOD_MS         10U
 
 /*
  * Защита от явно ошибочного показания ADS1115.
  */
-#define ITV_SENSOR_MIN_VALID         -0.05f
-#define ITV_SENSOR_MAX_VALID          6.00f
+#define ITV_SENSOR_MIN_VALID          0.35f
+#define ITV_SENSOR_MAX_VALID          2.05f
 
 /* =========================================================
  * АНАЛОГОВЫЕ СИГНАЛЫ
  * ========================================================= */
 
-float ITV_PRESSURE = 0.0f;
+float ITV_PRESSURE = PRESSURE_SENSOR_ZERO_V;
 
-/*
- * Временно не используется.
- * Канал ADS1115_CHANNEL_3 не читается.
- */
 float REG_ITV = 0.0f;
 
 float REG_CAROUSEL = 0.0f;
@@ -161,6 +158,7 @@ volatile uint8_t bigairon = 0;
  * Время последнего шага регулирования.
  */
 static uint32_t itv_control_tick = 0;
+static float itv_integral_v = 0.0f;
 
 /* =========================================================
  * СЧЁТЧИКИ
@@ -218,7 +216,7 @@ int main(void)
     adc.address = ADS1115_DEFAULT_ADDR;
 
     adc.pga = ADS1115_PGA_6_144V;
-    adc.data_rate = ADS1115_DR_128SPS;
+    adc.data_rate = ADS1115_DR_475SPS;
 
     ADS1115_Init(&adc);
 
@@ -260,15 +258,11 @@ int main(void)
             &REG_CARRIAGE
         );
 
-        /*
-         * REG_ITV временно отключён.
-         *
-         * ADS1115_ReadVoltageSingleEnded(
-         *     &adc,
-         *     ADS1115_CHANNEL_3,
-         *     &REG_ITV
-         * );
-         */
+        ADS1115_ReadVoltageSingleEnded(
+            &adc,
+            ADS1115_CHANNEL_3,
+            &REG_ITV
+        );
 
         /* =================================================
          * РЕГУЛИРОВАНИЕ ДАВЛЕНИЯ
@@ -502,129 +496,87 @@ int main(void)
 void ITV_PressureControl(void)
 {
     uint32_t current_tick = HAL_GetTick();
+    uint32_t elapsed_ms = current_tick - itv_control_tick;
+    float reg_itv;
+    float target_pressure_v;
+    float error_v;
+    float proportional_v;
+    float candidate_v;
+    float dt_s;
 
-    /*
-     * Запускаем регулирование раз в 20 мс.
-     */
-    if ((current_tick - itv_control_tick) <
-        ITV_CONTROL_PERIOD_MS)
+    if (elapsed_ms < ITV_CONTROL_PERIOD_MS)
     {
         return;
     }
 
     itv_control_tick = current_tick;
 
-    /*
-     * При выключенном воздухе сбрасываем
-     * выход ЦАП в ноль.
-     */
     if (bigairon == 0)
     {
         AIROUT = 0.0f;
+        itv_integral_v = 0.0f;
         return;
     }
 
-    /*
-     * Защита от явно некорректного показания датчика.
-     */
     if ((ITV_PRESSURE < ITV_SENSOR_MIN_VALID) ||
         (ITV_PRESSURE > ITV_SENSOR_MAX_VALID))
     {
         AIROUT = 0.0f;
+        itv_integral_v = 0.0f;
         return;
     }
 
-    /*
-     * Давление ниже рабочего диапазона.
-     * Увеличиваем AIROUT.
-     */
-    if (ITV_PRESSURE < ITV_PRESSURE_MIN)
+    reg_itv = REG_ITV;
+    if (reg_itv < 0.0f)
     {
-        float error;
-        float step_up;
+        reg_itv = 0.0f;
+    }
+    else if (reg_itv > REG_ITV_INPUT_MAX_V)
+    {
+        reg_itv = REG_ITV_INPUT_MAX_V;
+    }
 
-        error = ITV_PRESSURE_MIN - ITV_PRESSURE;
+    target_pressure_v = PRESSURE_SENSOR_ZERO_V +
+        (reg_itv / REG_ITV_INPUT_MAX_V) *
+        (WORK_PRESSURE_MAX_BAR / PRESSURE_SENSOR_FULL_BAR) *
+        PRESSURE_SENSOR_SPAN_V;
 
-        /*
-         * При большом отставании даём быстрый набор.
-         * При приближении к рабочей точке уменьшаем шаг.
-         */
-        if (error > 0.20f)
-        {
-            step_up = 0.10f;
-        }
-        else if (error > 0.10f)
-        {
-            step_up = 0.05f;
-        }
-        else if (error > 0.03f)
-        {
-            step_up = 0.02f;
-        }
-        else if (error > 0.01f)
-        {
-            step_up = 0.01f;
-        }
-        else
-        {
-            step_up = 0.005f;
-        }
+    error_v = target_pressure_v - ITV_PRESSURE;
+    if ((error_v > -ITV_CONTROL_DEADBAND_V) &&
+        (error_v < ITV_CONTROL_DEADBAND_V))
+    {
+        error_v = 0.0f;
+    }
 
-        AIROUT += step_up;
+    proportional_v = ITV_CONTROL_KP * error_v;
+    candidate_v = reg_itv + proportional_v + itv_integral_v;
+    dt_s = (float)elapsed_ms / 1000.0f;
 
-        if (AIROUT > ITV_OUTPUT_MAX)
+    /* Не накапливаем интеграл дальше в сторону насыщения выхода. */
+    if (((candidate_v < ITV_OUTPUT_MAX) &&
+         (candidate_v > ITV_OUTPUT_MIN)) ||
+        ((candidate_v >= ITV_OUTPUT_MAX) && (error_v < 0.0f)) ||
+        ((candidate_v <= ITV_OUTPUT_MIN) && (error_v > 0.0f)))
+    {
+        itv_integral_v += ITV_CONTROL_KI * error_v * dt_s;
+        if (itv_integral_v > ITV_INTEGRAL_LIMIT_V)
         {
-            AIROUT = ITV_OUTPUT_MAX;
+            itv_integral_v = ITV_INTEGRAL_LIMIT_V;
+        }
+        else if (itv_integral_v < -ITV_INTEGRAL_LIMIT_V)
+        {
+            itv_integral_v = -ITV_INTEGRAL_LIMIT_V;
         }
     }
-    /*
-     * Давление выше 0.41.
-     * Не выключаем выход, а постепенно уменьшаем.
-     */
-    else if (ITV_PRESSURE > ITV_PRESSURE_MAX)
+
+    AIROUT = reg_itv + proportional_v + itv_integral_v;
+    if (AIROUT > ITV_OUTPUT_MAX)
     {
-        float excess;
-        float step_down;
-
-        excess = ITV_PRESSURE - ITV_PRESSURE_MAX;
-
-        /*
-         * Чем сильнее превышение,
-         * тем быстрее снижаем выход.
-         */
-        if (excess > 0.10f)
-        {
-            step_down = 0.05f;
-        }
-        else if (excess > 0.03f)
-        {
-            step_down = 0.02f;
-        }
-        else if (excess > 0.01f)
-        {
-            step_down = 0.01f;
-        }
-        else
-        {
-            step_down = 0.005f;
-        }
-
-        AIROUT -= step_down;
-
-        if (AIROUT < ITV_OUTPUT_MIN)
-        {
-            AIROUT = ITV_OUTPUT_MIN;
-        }
+        AIROUT = ITV_OUTPUT_MAX;
     }
-    else
+    else if (AIROUT < ITV_OUTPUT_MIN)
     {
-        /*
-         * Давление находится в диапазоне:
-         *
-         * 0.400 ... 0.410
-         *
-         * Текущее значение AIROUT сохраняется.
-         */
+        AIROUT = ITV_OUTPUT_MIN;
     }
 }
 
